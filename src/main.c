@@ -7,6 +7,7 @@
 #include <hardware/clocks.h>
 #include <pico/multicore.h>
 #include <pico/stdlib.h>
+#include <pico/util/queue.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -47,24 +48,32 @@ typedef struct {
 	cdc_line_coding_t usb_lc;
 	cdc_line_coding_t uart_lc;
 	mutex_t lc_mtx;
-	uint8_t uart_buffer[BUFFER_SIZE];
-	uint32_t uart_pos;
-	mutex_t uart_mtx;
-	uint8_t usb_buffer[BUFFER_SIZE];
-	uint32_t usb_pos;
-	mutex_t usb_mtx;
+	queue_t uart_to_usb_fifo;
+	queue_t usb_to_uart_fifo;
 } uart_data_t;
 
 // PIO helper
-static inline void put_pixel(uint32_t pixel_grb) {
-    pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
-}
 
+// Color packing helper (for WS2812 GRB/RGB order)
+// This version packs as R, G, B in the bytes, and put_pixel shifts it.
 static inline uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
     return
-            ((uint32_t) (r) << 8) |
-            ((uint32_t) (g) << 16) |
+            ((uint32_t) (r) << 16) |
+            ((uint32_t) (g) << 8) |
             (uint32_t) (b);
+}
+
+static inline void put_pixel(uint32_t pixel_rgb) {
+    // We send 24 bits. Most WS2812 programs expect G, R, B order.
+    // Our packed format is 0x00RRGGBB.
+    // To send G, R, B:
+    uint8_t r = (pixel_rgb >> 16) & 0xFF;
+    uint8_t g = (pixel_rgb >> 8) & 0xFF;
+    uint8_t b = pixel_rgb & 0xFF;
+    
+    // Pack as GRB for the PIO
+    uint32_t grb = ((uint32_t)g << 24) | ((uint32_t)r << 16) | ((uint32_t)b << 8);
+    pio_sm_put_blocking(pio0, 0, grb);
 }
 
 void uart0_irq_fn(void);
@@ -152,41 +161,27 @@ void update_uart_cfg(uint8_t itf)
 void usb_read_bytes(uint8_t itf)
 {
 	uart_data_t *ud = &UART_DATA;
+	uint8_t buffer[64];
 	uint32_t len = tud_cdc_n_available(itf);
 
-	if (len &&
-	    mutex_try_enter(&ud->usb_mtx, NULL)) {
-		len = MIN(len, BUFFER_SIZE - ud->usb_pos);
-		if (len) {
-			uint32_t count;
-
-			count = tud_cdc_n_read(itf, &ud->usb_buffer[ud->usb_pos], len);
-			ud->usb_pos += count;
+	if (len) {
+		len = MIN(len, sizeof(buffer));
+		uint32_t count = tud_cdc_n_read(itf, buffer, len);
+		for (uint32_t i = 0; i < count; i++) {
+			queue_try_add(&ud->usb_to_uart_fifo, &buffer[i]);
 		}
-
-		mutex_exit(&ud->usb_mtx);
 	}
 }
 
 void usb_write_bytes(uint8_t itf)
 {
 	uart_data_t *ud = &UART_DATA;
+	uint8_t ch;
 
-	if (ud->uart_pos &&
-	    mutex_try_enter(&ud->uart_mtx, NULL)) {
-		uint32_t count;
-		
-		count = tud_cdc_n_write(itf, ud->uart_buffer, ud->uart_pos);
-		if (count < ud->uart_pos)
-			memmove(ud->uart_buffer, &ud->uart_buffer[count],
-			       ud->uart_pos - count);
-		ud->uart_pos -= count;
-
-		mutex_exit(&ud->uart_mtx);
-
-		if (count)
-			tud_cdc_n_write_flush(itf);
+	while (tud_cdc_n_write_available(itf) && queue_try_remove(&ud->uart_to_usb_fifo, &ch)) {
+		tud_cdc_n_write(itf, &ch, 1);
 	}
+	tud_cdc_n_write_flush(itf);
 }
 
 void tud_cdc_send_break_cb(uint8_t itf, uint16_t duration_ms) {
@@ -234,19 +229,24 @@ void usb_cdc_process(uint8_t itf)
 // LED update logic
 void update_leds(void) {
     uint32_t now = to_ms_since_boot(get_absolute_time());
+    static uint32_t last_led_update = 0;
     
+    // Rate limit LED updates to 100Hz
+    if (now - last_led_update < 10) return;
+    last_led_update = now;
+
     if (!tud_ready()) {
-        put_pixel(urgb_u32(128, 0, 0)); // Red - Not Ready
+        put_pixel(urgb_u32(16, 0, 0)); // Dim Red - Not Ready
         gpio_put(ONBOARD_LED_PIN, 0);
     } else {
         gpio_put(ONBOARD_LED_PIN, 1); // USB Connected
         
         if (now < rx_activity_timer) {
-            put_pixel(urgb_u32(0, 0, 255)); // Blue - RX Activity
+            put_pixel(urgb_u32(0, 0, 32)); // Dim Blue - RX Activity
         } else if (now < tx_activity_timer) {
-            put_pixel(urgb_u32(255, 128, 0)); // Orange - TX Activity
+            put_pixel(urgb_u32(32, 16, 0)); // Dim Orange - TX Activity
         } else {
-            put_pixel(urgb_u32(0, 32, 0)); // Dim Green - Idle
+            put_pixel(urgb_u32(0, 8, 0)); // Very Dim Green - Idle
         }
     }
 }
@@ -265,48 +265,34 @@ void core1_entry(void)
 	}
 }
 
-static inline void uart_read_bytes(uint8_t itf)
+static inline void uart_read_bytes(void)
 {
 	uart_data_t *ud = &UART_DATA;
 	const uart_id_t *ui = &UART_ID;
 
-	if (uart_is_readable(ui->inst)) {
-		mutex_enter_blocking(&ud->uart_mtx);
-		rx_activity_timer = to_ms_since_boot(get_absolute_time()) + 50;
-
-		if(ud->uart_pos < BUFFER_SIZE) {
-                        ud->uart_buffer[ud->uart_pos] = uart_getc(ui->inst);
-                        ud->uart_pos++;
-		} else {
-				uart_getc(ui->inst); // drop it on the floor
+	while (uart_is_readable(ui->inst)) {
+		uint8_t ch = uart_getc(ui->inst);
+		if (!queue_try_add(&ud->uart_to_usb_fifo, &ch)) {
+			// FIFO full, data dropped
 		}
-		mutex_exit(&ud->uart_mtx);
+		rx_activity_timer = to_ms_since_boot(get_absolute_time()) + 50;
 	}
 }
 
 void uart0_irq_fn(void)
 {
-	uart_read_bytes(0);
+	uart_read_bytes();
 }
 
-void uart_write_bytes(uint8_t itf)
+void uart_write_bytes(void)
 {
 	uart_data_t *ud = &UART_DATA;
+	const uart_id_t *ui = &UART_ID;
+	uint8_t ch;
 
-	if (ud->usb_pos &&
-	    mutex_try_enter(&ud->usb_mtx, NULL)) {
-		const uart_id_t *ui = &UART_ID;
-		
-		if(uart_is_writable(ui->inst)) {
-			tx_activity_timer = to_ms_since_boot(get_absolute_time()) + 50;
-			uart_putc_raw(ui->inst, ud->usb_buffer[0]);
-			if(ud->usb_pos > 1) {
-					memmove(ud->usb_buffer, &ud->usb_buffer[1], ud->usb_pos - 1);
-			}
-			ud->usb_pos--;
-		}
-
-		mutex_exit(&ud->usb_mtx);
+	while (uart_is_writable(ui->inst) && queue_try_remove(&ud->usb_to_uart_fifo, &ch)) {
+		uart_putc_raw(ui->inst, ch);
+		tx_activity_timer = to_ms_since_boot(get_absolute_time()) + 50;
 	}
 }
 
@@ -343,14 +329,12 @@ void init_uart_data(uint8_t itf)
 	ud->uart_lc.parity = DEF_PARITY;
 	ud->uart_lc.stop_bits = DEF_STOP_BITS;
 
-	/* Buffer */
-	ud->uart_pos = 0;
-	ud->usb_pos = 0;
+	/* Queues */
+	queue_init(&ud->uart_to_usb_fifo, 1, BUFFER_SIZE);
+	queue_init(&ud->usb_to_uart_fifo, 1, BUFFER_SIZE);
 
 	/* Mutex */
 	mutex_init(&ud->lc_mtx);
-	mutex_init(&ud->uart_mtx);
-	mutex_init(&ud->usb_mtx);
 
 	/* UART start */
 	uart_init(ui->inst, ud->usb_lc.bit_rate);
@@ -387,7 +371,7 @@ int main(void)
 
 	while (1) {
 			update_uart_cfg(0);
-			uart_write_bytes(0);
+			uart_write_bytes();
 	}
 
 	return 0;

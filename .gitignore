@@ -1,8 +1,19 @@
+# Build directories
+build/
+bin/
+obj/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+compile_commands.json
+
+# Dependencies (if downloaded locally)
 sdk/
 tools/
-build/
-*.uf2
-*.elf
-*.bin
-*.map
+
+# OS files
 .DS_Store
+Thumbs.db

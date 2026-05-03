@@ -1,42 +1,55 @@
-# RP2040 USB to UART Bridge (VCC-GND Board Edition)
+# RP2040 USB-to-TTL Serial Bridge
 
-A high-performance USB-to-TTL serial adapter firmware for RP2040 boards, specifically optimized for the "VCC-GND" style boards with an onboard WS2812 ARGB LED.
-
-![Board Photo](board_photo.png)
+A high-performance USB-to-UART bridge firmware for RP2040-based boards. Specifically optimized for boards with an onboard WS2812 RGB LED (like the VCC-GND style boards).
 
 ## Features
-- **USB CDC to UART**: Transparent bridge between USB and physical UART.
-- **Optimized Pinout**: Uses GPIO 0 (TX) and GPIO 1 (RX) for easy wiring.
-- **DTR/RTS Support**: Full hardware control for flashing ESP32/ESP8266 and other devices.
-- **Visual Feedback**:
-    - **Red**: Not Ready / Disconnected.
-    - **Dim Green**: Idle / Ready.
-    - **Blue Flash**: RX Activity (from device).
-    - **Orange Flash**: TX Activity (to device).
-- **Onboard LED**: GP25 indicates active USB connection.
+- **USB CDC to UART**: Provides a standard serial port on your computer.
+- **DTR/RTS Support**: Supports hardware flow control and auto-reset for ESP32/ESP8266 flashing.
+- **Visual Status (RGB LED)**:
+  - 🔴 **Red**: USB Not Ready / Disconnected.
+  - 🟢 **Dim Green**: Idle / Ready.
+  - 🔵 **Blue Flash**: Receiving data from device (RX).
+  - 🟠 **Orange Flash**: Sending data to device (TX).
+- **Onboard LED**: GP25 indicates an active USB connection.
 
-## Pinout
-| Pin Name | GPIO | Board Header Position |
-|----------|------|-----------------------|
-| **TX**   | 0    | Top-Left              |
-| **RX**   | 1    | Next to TX            |
-| **GND**  | -    | Next to RX            |
-| **DTR**  | 2    | Next to GND           |
-| **RTS**  | 3    | Next to DTR           |
+## Pinout Configuration
 
-![Pinout Diagram](board_pinout.png)
+| Function | GPIO | Physical Pin (Standard Pico) |
+|----------|------|-----------------------------|
+| **TX** (Output) | 0 | Pin 1 |
+| **RX** (Input)  | 1 | Pin 2 |
+| **GND** | - | Any Ground Pin |
+| **DTR** | 2 | Pin 4 |
+| **RTS** | 3 | Pin 5 |
 
-## Building
-1. Install [Pico SDK](https://github.com/raspberrypi/pico-sdk) and ARM GCC toolchain.
-2. Initialize build:
+*Note: Connect the board's **TX** to your device's **RX**, and the board's **RX** to your device's **TX**.*
+
+## Build Instructions
+
+### Prerequisites
+- [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk)
+- ARM GCC Toolchain (`gcc-arm-none-eabi`)
+- CMake
+
+### Building
+1. Create a build directory:
    ```bash
    mkdir build
    cd build
-   export PICO_SDK_PATH=path/to/pico-sdk
-   cmake ..
-   make
    ```
-3. Flash `uart_bridge.uf2` to your board.
+2. Configure with CMake:
+   ```bash
+   export PICO_SDK_PATH=/path/to/pico-sdk
+   cmake ..
+   ```
+3. Build:
+   ```bash
+   make -j$(nproc)
+   ```
+4. Flash the resulting `uart_bridge.uf2` to your RP2040 board by holding the BOOTSEL button while connecting it.
 
-## Credits
-Based on [rpzero-usb-uart](https://github.com/denandz/rpzero-usb-uart) by denandz.
+## Project Structure
+- `src/`: Source code (`main`, `usb_descriptors`).
+- `include/`: Header files (`tusb_config`).
+- `CMakeLists.txt`: Build configuration.
+- `README.md`: This file.
