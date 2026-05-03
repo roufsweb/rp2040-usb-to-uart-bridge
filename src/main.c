@@ -22,6 +22,7 @@ void usbd_serial_init(void);
 // Hardware Configuration for VCC-GND Board
 #define WS2812_PIN 23
 #define ONBOARD_LED_PIN 25
+#define USER_BUTTON_PIN 24
 
 #if !defined(MIN)
 #define MIN(a, b) ((a > b) ? b : a)
@@ -51,6 +52,12 @@ typedef struct {
 	queue_t uart_to_usb_fifo;
 	queue_t usb_to_uart_fifo;
 } uart_data_t;
+
+// State Globals
+bool sensing_mode = false;
+uint32_t detected_baud = 0;
+uint32_t last_button_press = 0;
+uint32_t swap_warning_timer = 0;
 
 // PIO helper
 
@@ -94,6 +101,60 @@ uart_data_t UART_DATA;
 uint32_t last_connection = 0;
 uint32_t rx_activity_timer = 0;
 uint32_t tx_activity_timer = 0;
+
+// Auto-Baud Detection logic
+void perform_auto_baud(void) {
+    const uart_id_t *ui = &UART_ID;
+    uint32_t min_pulse = 0xFFFFFFFF;
+    
+    // Disable UART temporarily to sample the pin
+    irq_set_enabled(ui->irq, false);
+    gpio_set_function(ui->rx_pin, GPIO_FUNC_SIO);
+    
+    absolute_time_t timeout = make_timeout_time_ms(500); // 500ms timeout
+    
+    while (absolute_time_diff_us(get_absolute_time(), timeout) > 0) {
+        // Wait for a falling edge (start of a bit)
+        while (gpio_get(ui->rx_pin) && absolute_time_diff_us(get_absolute_time(), timeout) > 0);
+        absolute_time_t start = get_absolute_time();
+        
+        // Wait for rising edge
+        while (!gpio_get(ui->rx_pin) && absolute_time_diff_us(get_absolute_time(), timeout) > 0);
+        absolute_time_t end = get_absolute_time();
+        
+        uint32_t diff = absolute_time_diff_us(start, end);
+        if (diff > 2 && diff < min_pulse) {
+            min_pulse = diff;
+        }
+    }
+    
+    // Restore UART
+    gpio_set_function(ui->rx_pin, GPIO_FUNC_UART);
+    irq_set_enabled(ui->irq, true);
+    
+    if (min_pulse != 0xFFFFFFFF && min_pulse > 0) {
+        detected_baud = 1000000 / min_pulse;
+        // Snap to common bauds
+        uint32_t common_bauds[] = {1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
+        for (int i = 0; i < 11; i++) {
+            if (detected_baud > common_bauds[i] * 0.85 && detected_baud < common_bauds[i] * 1.15) {
+                detected_baud = common_bauds[i];
+                break;
+            }
+        }
+        
+        uart_data_t *ud = &UART_DATA;
+        mutex_enter_blocking(&ud->lc_mtx);
+        ud->usb_lc.bit_rate = detected_baud;
+        mutex_exit(&ud->lc_mtx);
+        
+        // Signal success with LED
+        for(int i=0; i<3; i++) {
+            put_pixel(urgb_u32(0, 32, 0)); sleep_ms(50);
+            put_pixel(urgb_u32(0, 0, 0)); sleep_ms(50);
+        }
+    }
+}
 
 static inline uint databits_usb2uart(uint8_t data_bits)
 {
@@ -235,6 +296,21 @@ void update_leds(void) {
     if (now - last_led_update < 10) return;
     last_led_update = now;
 
+    if (sensing_mode) {
+        // Pulsing White
+        uint8_t b = (now / 4) % 64;
+        if (b > 32) b = 64 - b;
+        put_pixel(urgb_u32(b, b, b));
+        return;
+    }
+
+    if (now < swap_warning_timer) {
+        // Flash Red for Swap Warning
+        if ((now / 100) % 2) put_pixel(urgb_u32(32, 0, 0));
+        else put_pixel(urgb_u32(0, 0, 0));
+        return;
+    }
+
     if (!tud_ready()) {
         put_pixel(urgb_u32(16, 0, 0)); // Dim Red - Not Ready
         gpio_put(ONBOARD_LED_PIN, 0);
@@ -317,6 +393,11 @@ void init_uart_data(uint8_t itf)
     gpio_init(ONBOARD_LED_PIN);
     gpio_set_dir(ONBOARD_LED_PIN, GPIO_OUT);
 
+    // User Button (GP24)
+    gpio_init(USER_BUTTON_PIN);
+    gpio_set_dir(USER_BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(USER_BUTTON_PIN);
+
 	/* USB CDC LC */
 	ud->usb_lc.bit_rate = DEF_BIT_RATE;
 	ud->usb_lc.data_bits = DEF_DATA_BITS;
@@ -372,6 +453,24 @@ int main(void)
 	while (1) {
 			update_uart_cfg(0);
 			uart_write_bytes();
+
+            // Button sensing for Auto-Baud
+            if (!gpio_get(USER_BUTTON_PIN)) {
+                sensing_mode = true;
+                perform_auto_baud();
+                sensing_mode = false;
+            }
+
+            // Swap detection: Monitor TX pin when not transmitting
+            const uart_id_t *ui = &UART_ID;
+            if (to_ms_since_boot(get_absolute_time()) > tx_activity_timer + 100) {
+                gpio_set_function(ui->tx_pin, GPIO_FUNC_SIO);
+                if (!gpio_get(ui->tx_pin)) {
+                    // TX pin is low, but we aren't sending. Likely a swap.
+                    swap_warning_timer = to_ms_since_boot(get_absolute_time()) + 1000;
+                }
+                gpio_set_function(ui->tx_pin, GPIO_FUNC_UART);
+            }
 	}
 
 	return 0;
