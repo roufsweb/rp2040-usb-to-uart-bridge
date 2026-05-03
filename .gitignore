@@ -1,0 +1,8 @@
+sdk/
+tools/
+build/
+*.uf2
+*.elf
+*.bin
+*.map
+.DS_Store
