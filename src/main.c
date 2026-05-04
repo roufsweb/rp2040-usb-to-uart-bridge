@@ -27,7 +27,7 @@ void usbd_serial_init(void);
 #define MIN(a, b) ((a > b) ? b : a)
 #endif /* MIN */
 
-#define BUFFER_SIZE 4096 // Increased for better burst handling
+#define BUFFER_SIZE 4096
 
 #define DEF_BIT_RATE 115200
 #define DEF_STOP_BITS 1
@@ -50,6 +50,7 @@ typedef struct {
 	mutex_t lc_mtx;
 	queue_t uart_to_usb_fifo;
 	queue_t usb_to_uart_fifo;
+    volatile bool baud_updated;
 } uart_data_t;
 
 // Color packing helper
@@ -116,25 +117,24 @@ void update_uart_cfg(void)
 	uart_data_t *ud = &UART_DATA;
 
 	mutex_enter_blocking(&ud->lc_mtx);
+    cdc_line_coding_t usb_lc = ud->usb_lc;
+    mutex_exit(&ud->lc_mtx);
 
-	if (ud->usb_lc.bit_rate != ud->uart_lc.bit_rate) {
-		uart_set_baudrate(ui->inst, ud->usb_lc.bit_rate);
-		ud->uart_lc.bit_rate = ud->usb_lc.bit_rate;
-	}
+    // Apply baudrate
+    if (usb_lc.bit_rate != ud->uart_lc.bit_rate) {
+        uart_set_baudrate(ui->inst, usb_lc.bit_rate);
+        ud->uart_lc.bit_rate = usb_lc.bit_rate;
+    }
 
-	if ((ud->usb_lc.stop_bits != ud->uart_lc.stop_bits) ||
-	    (ud->usb_lc.parity != ud->uart_lc.parity) ||
-	    (ud->usb_lc.data_bits != ud->uart_lc.data_bits)) {
-		uart_set_format(ui->inst,
-				databits_usb2uart(ud->usb_lc.data_bits),
-				stopbits_usb2uart(ud->usb_lc.stop_bits),
-				parity_usb2uart(ud->usb_lc.parity));
-		ud->uart_lc.data_bits = ud->usb_lc.data_bits;
-		ud->uart_lc.parity = ud->usb_lc.parity;
-		ud->uart_lc.stop_bits = ud->usb_lc.stop_bits;
-	}
-
-	mutex_exit(&ud->lc_mtx);
+    // Apply format
+    uart_set_format(ui->inst,
+            databits_usb2uart(usb_lc.data_bits),
+            stopbits_usb2uart(usb_lc.stop_bits),
+            parity_usb2uart(usb_lc.parity));
+    
+    ud->uart_lc.data_bits = usb_lc.data_bits;
+    ud->uart_lc.parity = usb_lc.parity;
+    ud->uart_lc.stop_bits = usb_lc.stop_bits;
 }
 
 void usb_read_bytes(uint8_t itf)
@@ -142,9 +142,9 @@ void usb_read_bytes(uint8_t itf)
 	uart_data_t *ud = &UART_DATA;
 	uint8_t buffer[64];
 	
-    while (tud_cdc_n_available(itf)) {
-        uint32_t len = tud_cdc_n_available(itf);
-		len = MIN(len, sizeof(buffer));
+    uint32_t avail = tud_cdc_n_available(itf);
+    if (avail) {
+		uint32_t len = MIN(avail, sizeof(buffer));
 		uint32_t count = tud_cdc_n_read(itf, buffer, len);
 		for (uint32_t i = 0; i < count; i++) {
 			if (!queue_try_add(&ud->usb_to_uart_fifo, &buffer[i])) break;
@@ -163,26 +163,25 @@ void usb_write_bytes(uint8_t itf)
 	tud_cdc_n_write_flush(itf);
 }
 
+// Host changes line coding
+void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const* p_line_coding)
+{
+    uart_data_t *ud = &UART_DATA;
+    mutex_enter_blocking(&ud->lc_mtx);
+    ud->usb_lc = *p_line_coding;
+    ud->baud_updated = true;
+    mutex_exit(&ud->lc_mtx);
+}
+
 void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts)
 {
 	const uart_id_t *ui = &UART_ID;
-    
-    // Simple passthrough for DTR/RTS
     gpio_put(ui->rts_pin, rts);
     gpio_put(ui->dtr_pin, dtr);
 }
 
 void usb_cdc_process(uint8_t itf)
 {
-	uart_data_t *ud = &UART_DATA;
-
-    // Update Line Coding
-    cdc_line_coding_t lc;
-    tud_cdc_n_get_line_coding(itf, &lc);
-	mutex_enter_blocking(&ud->lc_mtx);
-	ud->usb_lc = lc;
-	mutex_exit(&ud->lc_mtx);
-
 	usb_read_bytes(itf);
 	usb_write_bytes(itf);
 }
@@ -219,7 +218,6 @@ void core1_entry(void)
 	}
 }
 
-// UART RX (Target -> PC) handled by IRQ
 void uart_read_bytes(void)
 {
 	uart_data_t *ud = &UART_DATA;
@@ -233,7 +231,6 @@ void uart_read_bytes(void)
 
 void uart0_irq_fn(void) { uart_read_bytes(); }
 
-// UART TX (PC -> Target) handled by Main Loop
 void uart_write_bytes(void)
 {
 	uart_data_t *ud = &UART_DATA;
@@ -262,20 +259,18 @@ void init_uart_data(uint8_t itf)
 	ud->usb_lc.parity = DEF_PARITY; 
     ud->usb_lc.stop_bits = DEF_STOP_BITS;
 	ud->uart_lc = ud->usb_lc;
+    ud->baud_updated = false;
 
 	queue_init(&ud->uart_to_usb_fifo, 1, BUFFER_SIZE);
 	queue_init(&ud->usb_to_uart_fifo, 1, BUFFER_SIZE);
 	mutex_init(&ud->lc_mtx);
 
 	uart_init(ui->inst, ud->usb_lc.bit_rate);
+    uart_set_fifo_enabled(ui->inst, true);
 	uart_set_hw_flow(ui->inst, false, false);
 	uart_set_format(ui->inst, databits_usb2uart(ud->usb_lc.data_bits),
 			stopbits_usb2uart(ud->usb_lc.stop_bits), parity_usb2uart(ud->usb_lc.parity));
 	
-    // Enable FIFO for better stability
-    uart_set_fifo_enabled(ui->inst, true);
-	uart_set_translate_crlf(ui->inst, false);
-
 	irq_set_exclusive_handler(ui->irq, ui->irq_fn);
 	irq_set_enabled(ui->irq, true);
 	uart_set_irq_enables(ui->inst, true, false);
@@ -283,7 +278,7 @@ void init_uart_data(uint8_t itf)
 
 int main(void)
 {
-    set_sys_clock_khz(125000, false);
+    stdio_init_all();
     multicore_reset_core1();
 	usbd_serial_init();
 	init_uart_data(0);
@@ -295,7 +290,10 @@ int main(void)
 	multicore_launch_core1(core1_entry);
 
 	while (1) {
-		update_uart_cfg();
+        if (UART_DATA.baud_updated) {
+            update_uart_cfg();
+            UART_DATA.baud_updated = false;
+        }
 		uart_write_bytes();
 	}
 	return 0;
